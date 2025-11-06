@@ -1,10 +1,6 @@
 --[[
-Replay Buffer Sound Script (Optimized, Unicode-safe + cooldown)
+Replay Buffer Sound Script (Unicode-safe + cooldown)
 Plays a specified sound file whenever the OBS replay buffer is saved (Windows only).
-- Uses PlaySoundW (UTF-16) to support non-ASCII paths
-- Robust DLL loading & error logging
-- Cooldown to avoid rapid re-trigger spam
-- Performance optimizations: caching, reduced FFI calls
 ]]
 
 local obs = obslua
@@ -33,7 +29,7 @@ ffi.cdef[[
 local CP_UTF8 = 65001
 local PLAY_FLAGS = 0x00020003  -- SND_FILENAME | SND_ASYNC | SND_NODEFAULT
 
--- Time helper (select best available function once)
+-- Time helper
 local time_func = obs.os_gettime_ns and 
   function() return math.floor(obs.os_gettime_ns() / 1e6) end or
   function() return math.floor((os.clock() or 0) * 1000) end
@@ -43,8 +39,7 @@ local function now_ms()
 end
 
 local function can_play_now()
-  if cooldown_ms <= 0 or last_play_ms < 0 then return true end
-  return (now_ms() - last_play_ms) >= cooldown_ms
+  return cooldown_ms <= 0 or last_play_ms < 0 or (now_ms() - last_play_ms) >= cooldown_ms
 end
 
 -- UTF-8 -> UTF-16 helper
@@ -64,49 +59,48 @@ end
 
 -- Safely init DLLs
 local function init_libs()
+  if kernel32 and winmm then return true end
+  
   if not kernel32 then
     local ok, res = pcall(function() return ffi.load("kernel32") end)
-    if ok then
-      kernel32 = res
-      MultiByteToWideChar = ffi.C.MultiByteToWideChar
-    else
+    if not ok then
       obs.script_log(obs.LOG_ERROR, "[replay-buffer-sound] Failed to load kernel32: " .. tostring(res))
       return false
     end
+    kernel32 = res
+    MultiByteToWideChar = ffi.C.MultiByteToWideChar
   end
+  
   if not winmm then
     local ok, res = pcall(function() return ffi.load("winmm") end)
-    if ok then
-      winmm = res
-      PlaySoundW = winmm.PlaySoundW
-    else
+    if not ok then
       obs.script_log(obs.LOG_ERROR, "[replay-buffer-sound] Failed to load winmm.dll: " .. tostring(res))
       return false
     end
+    winmm = res
+    PlaySoundW = winmm.PlaySoundW
   end
+  
   return true
 end
 
 -- Play sound (uses cached wide string)
 local function play_sound()
-  if not sound_enabled or not file_exists or not sound_file_path_wide or not can_play_now() then
-    return false
-  end
-  if not init_libs() then
+  if not (sound_enabled and file_exists and sound_file_path_wide and can_play_now() and init_libs()) then
     return false
   end
 
   local ok, ret = pcall(PlaySoundW, sound_file_path_wide, nil, PLAY_FLAGS)
 
-  if not ok then
-    obs.script_log(obs.LOG_ERROR, "[replay-buffer-sound] Error playing sound: " .. tostring(ret))
-    return false
-  end
-
-  if ret ~= 0 then
+  if ok and ret ~= 0 then
     last_play_ms = now_ms()
     return true
   end
+  
+  if not ok then
+    obs.script_log(obs.LOG_ERROR, "[replay-buffer-sound] Error playing sound: " .. tostring(ret))
+  end
+  
   return false
 end
 
@@ -156,33 +150,32 @@ end
 function script_update(settings)
   local new_path = obs.obs_data_get_string(settings, "sound_file")
   
-  -- Only reprocess path if it changed
   if new_path ~= sound_file_path then
     sound_file_path = new_path
+    file_exists = false
+    sound_file_path_wide = nil
     
-    if new_path ~= "" then
-      file_exists = obs.os_file_exists(new_path)
-      if file_exists then
-        sound_file_path_wide = utf8_to_wide(new_path)
-        if not sound_file_path_wide then
-          obs.script_log(obs.LOG_WARNING, "[replay-buffer-sound] Failed to convert path to UTF-16")
-          file_exists = false
-        end
-      else
-        obs.script_log(obs.LOG_WARNING, "[replay-buffer-sound] Sound file not found: " .. new_path)
-        sound_file_path_wide = nil
+    if new_path ~= "" and obs.os_file_exists(new_path) then
+      sound_file_path_wide = utf8_to_wide(new_path)
+      file_exists = sound_file_path_wide ~= nil
+      
+      if not file_exists then
+        obs.script_log(obs.LOG_WARNING, "[replay-buffer-sound] Failed to convert path to UTF-16")
       end
-    else
-      file_exists = false
-      sound_file_path_wide = nil
+    elseif new_path ~= "" then
+      obs.script_log(obs.LOG_WARNING, "[replay-buffer-sound] Sound file not found: " .. new_path)
     end
   end
   
   sound_enabled = obs.obs_data_get_bool(settings, "sound_enabled")
   cooldown_ms = obs.obs_data_get_int(settings, "cooldown_ms") or 0
   
-  obs.script_log(obs.LOG_INFO, "[replay-buffer-sound] Sound file: " .. (sound_file_path ~= "" and sound_file_path or "<none>"))
-  obs.script_log(obs.LOG_INFO, "[replay-buffer-sound] Enabled: " .. tostring(sound_enabled) .. ", Cooldown: " .. tostring(cooldown_ms) .. " ms")
+  obs.script_log(obs.LOG_INFO, string.format(
+    "[replay-buffer-sound] Sound file: %s, Enabled: %s, Cooldown: %d ms",
+    sound_file_path ~= "" and sound_file_path or "<none>",
+    tostring(sound_enabled),
+    cooldown_ms
+  ))
 end
 
 function script_load(_settings)
